@@ -1,8 +1,9 @@
-fastapi==0.110.0
-uvicorn==0.29.0
-python-multipart
-tensorflow-cpu==2.10.0
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
 numpy==1.26.4
-pandas
-
-
+pandas==2.2.2
+scikit-learn==1.5.1
+python-multipart==0.0.9
+openpyxl==3.1.5
+scipy==1.13.1
+onnxruntime==1.18.0
