@@ -1,10 +1,11 @@
 fastapi==0.110.0
 uvicorn==0.29.0
 python-multipart
-tensorflow-cpu==2.16.1
+tensorflow-cpu==2.20.0
 numpy
 pandas
 openpyxl
 scipy
 scikit-learn
 onnxruntime
+
