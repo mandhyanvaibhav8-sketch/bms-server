@@ -7,15 +7,26 @@ from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from enum import Enum
 
 import onnxruntime as ort
 from sklearn.preprocessing import MinMaxScaler
 
+# TensorFlow/Keras for H5 model
+import tensorflow as tf
+tf.get_logger().setLevel('ERROR')  # Suppress TF warnings
+
 # ---------- Config ----------
-ONNX_PATH = os.environ.get("BMS_ONNX_PATH", "best_residual.onnx")
+ONNX_PATH = os.environ.get("BMS_ONNX_PATH", "best_residual.onnx")  # LTO model
+H5_PATH = os.environ.get("BMS_H5_PATH", "best_hybrid_residual_model.h5")  # Lithium Ion model
 WINDOW = 50
-ALLOW_TREND_ONLY_IF_NO_MODEL = False  # set True if you want fallback without ONNX
+ALLOW_TREND_ONLY_IF_NO_MODEL = False  # set True if you want fallback without model
 # ----------------------------
+
+# Battery type enum
+class BatteryType(str, Enum):
+    LTO = "LTO"
+    LITHIUM_ION = "LITHIUM_ION"
 
 # Optional SciPy exponential fit (fallback to poly2 if not available)
 USE_SCIPY = True
@@ -238,28 +249,62 @@ def infer_step(cycles: np.ndarray) -> float:
     diffs = np.diff(np.unique(cycles))
     return float(np.median(diffs)) if len(diffs) else 1.0
 
-def ensure_model() -> Optional[ort.InferenceSession]:
+# Cached model instances
+_onnx_session: Optional[ort.InferenceSession] = None
+_h5_model: Optional[tf.keras.Model] = None
+
+
+def ensure_onnx_model() -> Optional[ort.InferenceSession]:
+    """Load ONNX model for LTO battery prediction."""
+    global _onnx_session
+    if _onnx_session is not None:
+        return _onnx_session
     if not os.path.exists(ONNX_PATH):
         return None
     try:
-        # input name is "input" because we exported with that signature
-        return ort.InferenceSession(ONNX_PATH, providers=["CPUExecutionProvider"])
+        _onnx_session = ort.InferenceSession(ONNX_PATH, providers=["CPUExecutionProvider"])
+        return _onnx_session
     except Exception as e:
-        raise HTTPException(500, f"Failed to load ONNX: {e}")
+        raise HTTPException(500, f"Failed to load ONNX model: {e}")
+
+
+def ensure_h5_model() -> Optional[tf.keras.Model]:
+    """Load H5/Keras model for Lithium Ion battery prediction."""
+    global _h5_model
+    if _h5_model is not None:
+        return _h5_model
+    if not os.path.exists(H5_PATH):
+        return None
+    try:
+        _h5_model = tf.keras.models.load_model(H5_PATH, compile=False)
+        return _h5_model
+    except Exception as e:
+        raise HTTPException(500, f"Failed to load H5 model: {e}")
+
+
+def ensure_model(battery_type: BatteryType):
+    """Load appropriate model based on battery type."""
+    if battery_type == BatteryType.LTO:
+        return ensure_onnx_model(), "onnx"
+    else:
+        return ensure_h5_model(), "h5"
 
 # ----- Routes -----
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "onnx_found": os.path.exists(ONNX_PATH),
-        "window": WINDOW
+        "lto_model_found": os.path.exists(ONNX_PATH),
+        "lithium_ion_model_found": os.path.exists(H5_PATH),
+        "window": WINDOW,
+        "supported_battery_types": [bt.value for bt in BatteryType]
     }
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(
     file: UploadFile = File(...),
-    future_cycles: int = Form(...)
+    future_cycles: int = Form(...),
+    battery_type: BatteryType = Form(BatteryType.LTO)
 ):
     if future_cycles <= 0:
         raise HTTPException(400, "future_cycles must be > 0")
@@ -332,9 +377,11 @@ def predict(
     last = float(cycles[-1])
     future_axis = np.arange(last + step, last + step*(future_cycles+1), step, dtype=float)
 
-    # 5) Inference
-    session = ensure_model()
-    if session is None:
+    # 5) Inference - select model based on battery type
+    model, model_type = ensure_model(battery_type)
+    
+    if model is None:
+        model_name = "ONNX (LTO)" if battery_type == BatteryType.LTO else "H5 (Lithium Ion)"
         if ALLOW_TREND_ONLY_IF_NO_MODEL:
             y_future = trend_func(future_axis)
             preds = [Point(cycle=float(c), capacity=float(v)) for c, v in zip(future_axis, y_future)]
@@ -344,28 +391,41 @@ def predict(
                     "engine": engine,
                     "trend": trend_name,
                     "window": WINDOW,
-                    "note": "ONNX not found",
+                    "battery_type": battery_type.value,
+                    "note": f"{model_name} model not found",
                     **metrics
                 },
                 historical=[Point(cycle=float(c), capacity=float(y)) for c, y in zip(cycles, caps)],
                 predictions=preds
             )
         else:
-            raise HTTPException(503, "ONNX model not found on server.")
+            raise HTTPException(503, f"{model_name} model not found on server.")
 
-    input_name = session.get_inputs()[0].name  # "input" from export
     preds_out: List[Point] = []
 
     # simple EFC hold for future (you can improve later)
     efc_future_const = float(efc[-1]) if len(efc) else 0.0
 
+    # Get input name for ONNX model
+    input_name = None
+    if model_type == "onnx":
+        input_name = model.get_inputs()[0].name  # "input" from export
+
     for c in future_axis:
-        # build input window (WINDOW, 4)
+        # build input window
         window = np.array(hist_rows[-WINDOW:], dtype=np.float32)  # shape (50,4)
-        x = window.reshape(1, WINDOW, 4)  # (1,50,4)
 
         # model predicts residual_scaled
-        rhat_scaled = float(session.run(None, {input_name: x})[0][0][0])
+        if model_type == "onnx":
+            # ONNX inference for LTO - uses all 4 features: [Cycle_raw, Cycle_s, EFC_s, Residual_s]
+            x = window.reshape(1, WINDOW, 4)  # (1,50,4)
+            rhat_scaled = float(model.run(None, {input_name: x})[0][0][0])
+        else:
+            # H5/Keras inference for Lithium Ion - uses 3 features: [Cycle_s, EFC_s, Residual_s]
+            x = window[:, 1:].reshape(1, WINDOW, 3)  # (1,50,3) - skip first column (raw cycle)
+            prediction = model.predict(x, verbose=0)
+            rhat_scaled = float(prediction[0][0])
+        
         rhat = unscale_res(rhat_scaled)
 
         cap_pred = float(trend_func(np.array([c]))[0]) + rhat
@@ -376,11 +436,14 @@ def predict(
         efc_s = scale_efc(efc_future_const)
         hist_rows.append([float(c), float(cyc_s), float(efc_s), float(rhat_scaled)])
 
+    engine_name = "hybrid-residual-onnx" if battery_type == BatteryType.LTO else "hybrid-residual-keras"
+    
     return PredictResponse(
         meta={
-            "engine":"hybrid-residual-onnx",
+            "engine": engine_name,
             "trend": trend_name,
             "window": WINDOW,
+            "battery_type": battery_type.value,
             **metrics
         },
         historical=[Point(cycle=float(c), capacity=float(y)) for c, y in zip(cycles, caps)],
